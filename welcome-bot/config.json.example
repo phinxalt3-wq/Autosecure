@@ -1,0 +1,8 @@
+{
+  "guildid": "YOUR_GUILD_ID",
+  "welcomechannel": "WELCOME_CHANNEL_ID",
+  "memberrole": "MEMBER_ROLE_ID",
+  "buyChannels": [
+    "OPTIONAL_BUY_CHANNEL_ID"
+  ]
+}

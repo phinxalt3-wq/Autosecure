@@ -1,0 +1,15 @@
+{
+  "name": "welcome-bot",
+  "version": "0.1.0",
+  "description": "Standalone Discord welcome/leave bot extracted from Autosecure",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "dotenv": "^17.2.2",
+    "sqlite3": "^5.1.7"
+  }
+}

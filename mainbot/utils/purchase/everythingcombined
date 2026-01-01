@@ -1,0 +1,497 @@
+const axios = require('axios');
+const { v4: uuidv4 } = require('uuid');
+const bip39 = require('bip39');
+const bitcoin = require('bitcoinjs-lib');
+const litecore = require('bitcore-lib-ltc');
+const { BIP32Factory } = require('bip32');
+const ecc = require('tiny-secp256k1');
+const { queryParams } = require('../../utils/db');
+const { mainltc } = require('../../../config.json');
+
+// Initialize bip32 with secp256k1
+const bip32 = BIP32Factory(ecc);
+
+// Network configuration
+const litecoinNetwork = {
+  messagePrefix: '\x19Litecoin Signed Message:\n',
+  bech32: 'ltc',
+  bip32: {
+    public: 0x019da462,
+    private: 0x019d9cfe,
+  },
+  pubKeyHash: 0x30,
+  scriptHash: 0x32,
+  wif: 0xb0,
+};
+
+// Invoice status constants
+const INVOICE_STATUS = {
+  PENDING: 'pending',
+  RECEIVED: 'received',
+  AWAITING_CONFIRM: 'awaitingconfirm',
+  COMPLETED: 'completed',
+  CLOSED: 'closed',
+  FAILED: 'failed',
+  TERMINATED: 'terminated'
+};
+
+// Invoice map to track active invoices
+const invoicesMap = new Map();
+
+// Transaction check interval (30 seconds)
+const TRANSACTION_CHECK_INTERVAL = 30000;
+
+/**
+ * Validates a Litecoin address
+ * @param {string} address 
+ * @returns {boolean}
+ */
+function validLtcAddress(address) {
+  const legacyLTCRegex = /^(L|M)[a-zA-Z0-9]{26,33}$|^3[a-zA-Z0-9]{1,32}$/;
+  const bech32LTCRegex = /^(ltc1)[a-z0-9]{39,59}$/;
+  return legacyLTCRegex.test(address) || bech32LTCRegex.test(address);
+}
+
+/**
+ * Generates keys from mnemonic
+ * @param {string} mnemonic 
+ * @returns {{privateKey: litecore.PrivateKey, address: string, wif: string, success: boolean}}
+ */
+function getKeyFromMnemonic(mnemonic) {
+  try {
+    if (!bip39.validateMnemonic(mnemonic)) {
+      throw new Error("Invalid mnemonic phrase");
+    }
+
+    const seed = bip39.mnemonicToSeedSync(mnemonic);
+    const root = bip32.fromSeed(seed, litecoinNetwork);
+    const path = "m/44'/2'/0'/0/0";
+    const child = root.derivePath(path);
+    const privateKey = new litecore.PrivateKey(
+      child.privateKey,
+      litecore.Networks.livenet,
+      true
+    );
+
+    if (!litecore.PrivateKey.isValid(privateKey)) {
+      throw new Error("Invalid private key generated");
+    }
+
+    return { 
+      privateKey: privateKey,
+      address: privateKey.toAddress().toString(),
+      wif: privateKey.toWIF(),
+      success: true 
+    };
+  } catch (error) {
+    console.error("Key generation error:", error);
+    return {
+      message: error.message,
+      success: false
+    };
+  }
+}
+
+/**
+ * Gets address from mnemonic
+ * @param {string} mnemonic 
+ * @returns {{message: string, success: boolean, address: string}}
+ */
+function getAddressFromMnemonic(mnemonic) {
+  let key = getKeyFromMnemonic(mnemonic);
+  if (key.success && key.privateKey) {
+    let address = key.privateKey.toAddress().toString();
+    if (validLtcAddress(address)) {
+      return { address: address, success: true };
+    } else {
+      return { message: "Failed to get a valid LTC address", success: false };
+    }
+  } else {
+    return { message: `Failed to get key from the mnemonic! ${key.message}`, success: false };
+  }
+}
+
+/**
+ * Fetches current LTC price
+ * @returns {Promise<number|string>}
+ */
+async function fetchLtcPrice() {
+  try {
+    const { data } = await axios.get(`https://api.coingecko.com/api/v3/simple/price?ids=litecoin&vs_currencies=usd`);
+    if (data.litecoin && data.litecoin.usd) {
+      return Number(data.litecoin.usd);
+    } else {
+      return await fetchFallback();
+    }
+  } catch (e) {
+    console.log(e);
+    return await fetchFallback();
+  }
+}
+
+async function fetchFallback() {
+  try {
+    const { data } = await axios.get(`https://min-api.cryptocompare.com/data/price?fsym=LTC&tsyms=USD`);
+    if (data.USD) {
+      return Number(data.USD);
+    } else {
+      return "failed";
+    }
+  } catch (e) {
+    console.log(e);
+    return "failed";
+  }
+}
+
+class Invoice {
+  constructor(license, userid, creator, invoiceId = null) {
+    if (invoiceId) {
+      this.invoiceId = invoiceId;
+    } else {
+      const timestamp = Date.now();
+      const uniqueId = uuidv4();
+      this.invoiceId = `INVOICE-${timestamp}-${uniqueId}`;
+      this.availableUntil = Date.now() + 6000000;
+      this.price = 0;
+      this.address = '';
+      this.license = license;
+      this.creator = creator;
+      this.userid = userid;
+      this.mnemonic = '';
+      this.status = INVOICE_STATUS.PENDING;
+    }
+  }
+
+  async updateData() {
+    if (!this.invoiceId) return false;
+    
+    let invoiceData = await queryParams(
+      `SELECT * FROM invoices WHERE invoice_id=?`, 
+      [this.invoiceId], 
+      "all", 
+      "invoices"
+    );
+    
+    if (invoiceData?.length == 0) {
+      console.log(`Couldn't find invoice`);
+      return false;
+    }
+    
+    invoiceData = invoiceData[0];
+    this.availableUntil = invoiceData.available_until;
+    this.price = invoiceData.price;
+    this.address = invoiceData.address;
+    this.wallet = invoiceData.wallet;
+    this.license = invoiceData.license;
+    this.mnemonic = invoiceData.wallet;
+    this.userid = invoiceData.user_id;
+    this.creator = invoiceData.creator;
+    this.status = invoiceData.status || INVOICE_STATUS.PENDING;
+  }
+
+  async generateWallet() {
+    this.mnemonic = bip39.generateMnemonic();
+    const keyInfo = getKeyFromMnemonic(this.mnemonic);
+    
+    if (!keyInfo.success) {
+      throw new Error('Failed to generate wallet');
+    }
+    
+    this.address = keyInfo.address;
+    this.privateKey = keyInfo.privateKey;
+    return true;
+  }
+
+  async logInvoice() {
+    try {
+      await queryParams(
+        `INSERT INTO invoices(
+          invoice_id, price, address, wallet, 
+          license, available_until, user_id, creator, status
+        ) VALUES(?,?,?,?,?,?,?,?,?)`, 
+        [
+          this.invoiceId, this.price, this.address, this.mnemonic, 
+          this.license, this.availableUntil, this.userid, this.creator, this.status
+        ], 
+        "all", 
+        "invoices"
+      );
+      return true;
+    } catch (e) {
+      console.log(e);
+      return false;
+    }
+  }
+
+  async checkForTransactions() {
+    if (!this.invoiceId || !this.address || !this.license) return false;
+    
+    if (!validLtcAddress(this.address)) {
+      console.log(`Invalid Address ${this.address}`);
+      return false;
+    }
+
+    try {
+      // Check license status
+      let licenseQuery = await queryParams(
+        `SELECT * FROM licenses WHERE license=?`, 
+        [this.license]
+      );
+      
+      if (licenseQuery.length == 0) {
+        this.status = INVOICE_STATUS.TERMINATED;
+        await queryParams(
+          `UPDATE invoices SET status=? WHERE invoice_id=?`, 
+          [this.status, this.invoiceId]
+        );
+        return false;
+      }
+      
+      licenseQuery = licenseQuery[0];
+      let time = licenseQuery.available;
+      if (time == 0) {
+        time = Date.now() + 86400000;
+      }
+
+      // Check for transactions
+      const { data: utxos } = await axios.get(
+        `https://explorer.litecoin.net/api/address/${this.address}/txs/chain`
+      );
+      
+      if (Array.isArray(utxos)) {
+        let receivedAmount = 0;
+        
+        for (const utxo of utxos) {
+          if (Array.isArray(utxo.vout)) {
+            for (const vout of utxo.vout) {
+              if (vout.scriptpubkey_address === this.address) {
+                const txid = utxo.txid;
+                const txidQuery = await queryParams(
+                  `SELECT * FROM logs WHERE txid=?`, 
+                  [txid]
+                );
+                
+                if (txidQuery.length != 0) continue;
+                
+                const valueInLtc = vout.value / 100_000_000;
+                receivedAmount += valueInLtc;
+                
+                const valueInUsd = valueInLtc * this.price;
+                const timeAdded = (valueInUsd * 518_400_000).toFixed(0);
+                const finalTime = parseInt(time) + parseInt(timeAdded);
+                
+                console.log(
+                  `Added time for ${this.userid}, ${(timeAdded / 1000 / 60 / 60 / 24).toFixed(2)} Days, ` +
+                  `for ${valueInUsd}$ | ${valueInLtc} LTC`
+                );
+                
+                try {
+                  await queryParams(
+                    `INSERT INTO logs(
+                      txid, license, price, wallet, 
+                      address, user_id, creator, invoice_id
+                    ) VALUES(?,?,?,?,?,?,?,?)`, 
+                    [
+                      txid, this.license, this.price, this.wallet, 
+                      this.address, this.userid, this.creator, this.invoiceId
+                    ]
+                  );
+                  
+                  await queryParams(
+                    `UPDATE licenses SET available=? WHERE license=?`, 
+                    [finalTime, this.license]
+                  );
+                } catch (e) {
+                  console.log(e);
+                }
+              }
+            }
+          }
+        }
+
+        // Update invoice status based on received amount
+        if (receivedAmount > 0) {
+          const requiredAmount = this.price;
+          const tolerance = 0.0001; // Allow for small rounding differences
+          
+          if (Math.abs(receivedAmount - requiredAmount) < tolerance) {
+            this.status = INVOICE_STATUS.RECEIVED;
+          } else if (receivedAmount < requiredAmount) {
+            this.status = INVOICE_STATUS.AWAITING_CONFIRM;
+          } else {
+            this.status = INVOICE_STATUS.COMPLETED;
+          }
+          
+          await queryParams(
+            `UPDATE invoices SET status=? WHERE invoice_id=?`, 
+            [this.status, this.invoiceId]
+          );
+        }
+      }
+
+      if (this.availableUntil < Date.now()) {
+        await queryParams(
+          `UPDATE invoices SET status=? WHERE invoice_id=?`, 
+          [INVOICE_STATUS.CLOSED, this.invoiceId]
+        );
+      }
+
+    } catch (e) {
+      console.log(`Error while trying to fetch UTXOs: ${e}`);
+      return false;
+    }
+  }
+
+  async sendToMain() {
+    if (!mainltc || !this.mnemonic || !this.address) {
+      console.log('Missing required parameters for sendToMain');
+      return false;
+    }
+
+    try {
+      // Get UTXOs
+      const { data: utxos } = await axios.get(
+        `https://explorer.litecoin.net/api/address/${this.address}/utxo`
+      );
+      
+      if (!utxos || utxos.length === 0) {
+        console.log('No UTXOs found for address:', this.address);
+        return false;
+      }
+
+      // Calculate total balance
+      const totalAmount = utxos.reduce((sum, utxo) => sum + utxo.value, 0);
+      if (totalAmount <= 0) {
+        console.log('No balance to send');
+        return false;
+      }
+
+      // Get private key
+      const keyInfo = getKeyFromMnemonic(this.mnemonic);
+      if (!keyInfo.success) {
+        console.log('Failed to get private key from mnemonic');
+        return false;
+      }
+
+      // Create transaction
+      const transaction = new litecore.Transaction()
+        .from(utxos)
+        .to(mainltc, totalAmount - 10000) // Subtract fee
+        .change(this.address) // Send change back
+        .sign(keyInfo.privateKey);
+
+      // Broadcast transaction
+      const txHex = transaction.serialize();
+      const { data: txid } = await axios.post(
+        `https://explorer.litecoin.net/api/tx/send`, 
+        { rawtx: txHex }
+      );
+      
+      console.log(
+        `Sent ${totalAmount/100000000} LTC to main address ${mainltc}, ` +
+        `txid: ${txid}`
+      );
+      
+      this.status = INVOICE_STATUS.COMPLETED;
+      await queryParams(
+        `UPDATE invoices SET status=? WHERE invoice_id=?`, 
+        [this.status, this.invoiceId]
+      );
+      
+      return true;
+    } catch (e) {
+      console.error('Error in sendToMain:', e);
+      this.status = INVOICE_STATUS.FAILED;
+      await queryParams(
+        `UPDATE invoices SET status=? WHERE invoice_id=?`, 
+        [this.status, this.invoiceId]
+      );
+      return false;
+    }
+  }
+}
+
+/**
+ * Checks all active invoices for transactions
+ */
+async function checkForInvoicesTransactions() {
+  for (let invoice of invoicesMap.values()) {
+    try {
+      await invoice.checkForTransactions();
+      
+      // If payment received and confirmed, send to main address
+      if (invoice.status === INVOICE_STATUS.RECEIVED) {
+        await invoice.sendToMain();
+      }
+    } catch (e) {
+      console.error(`Error processing invoice ${invoice.invoiceId}:`, e);
+    }
+  }
+}
+
+/**
+ * Initializes invoices from database
+ */
+async function initializeInvoices() {
+  console.log('Initializing Invoices');
+  
+  try {
+    let invoices = await queryParams(
+      `SELECT * FROM invoices WHERE status NOT IN (?, ?)`, 
+      [INVOICE_STATUS.COMPLETED, INVOICE_STATUS.CLOSED], 
+      "all", 
+      "invoices"
+    );
+    
+    for (let invoice of invoices) {
+      let invoiceObject = new Invoice(
+        invoice.license, 
+        invoice.user_id, 
+        invoice.creator, 
+        invoice.invoice_id
+      );
+      
+      await invoiceObject.updateData();
+      invoicesMap.set(invoice.invoice_id, invoiceObject);
+      
+      // Process completed payments
+      if (invoice.status === INVOICE_STATUS.RECEIVED) {
+        await invoiceObject.sendToMain();
+      }
+    }
+    
+    // Start periodic checking
+    checkForInvoicesTransactions();
+    setInterval(checkForInvoicesTransactions, TRANSACTION_CHECK_INTERVAL);
+    
+    console.log(`Initialized ${invoicesMap.size} invoices`);
+  } catch (e) {
+    console.error('Error initializing invoices:', e);
+  }
+}
+
+/**
+ * Adds a new invoice to the system
+ * @param {Invoice} invoice 
+ */
+async function addInvoice(invoice) {
+  try {
+    await invoice.logInvoice();
+    invoicesMap.set(invoice.invoiceId, invoice);
+    return true;
+  } catch (e) {
+    console.error('Error adding invoice:', e);
+    return false;
+  }
+}
+
+module.exports = {
+  Invoice,
+  invoicesMap,
+  fetchLtcPrice,
+  initializeInvoices,
+  addInvoice,
+  checkForInvoicesTransactions,
+  getAddressFromMnemonic,
+  INVOICE_STATUS
+};
